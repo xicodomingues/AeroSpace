@@ -39,6 +39,9 @@ import Foundation
             }
             _ = await config.afterStartupCommand.run(.defaultEnv, .emptyStdin)
         }
+        // The saved layout has done its job. Kept, it would be replayed at the next unlock, over whatever
+        // changed since: the workspace command does not reset the cache.
+        resetClosedWindowsCache()
         PersistedLayout.isSavingEnabled = true
     }
 }
