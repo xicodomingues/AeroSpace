@@ -37,6 +37,12 @@ struct FrozenWorkspace: Sendable {
     }
 }
 
+/// At startup: the world a previous AeroSpace saved (PersistedLayout), restored window by window like the
+/// lock screen cache.
+@MainActor func seedClosedWindowsCache(_ world: FrozenWorld) {
+    closedWindowsCache = world
+}
+
 @MainActor func cacheClosedWindowIfNeeded() {
     let allWs = Workspace.all
     let allWindowIds = allWs.flatMap { collectAllWindowIdsRecursive($0) }.toSet()
@@ -54,6 +60,7 @@ struct FrozenWorkspace: Sendable {
     if !closedWindowsCache.windowIds.contains(newlyDetectedWindow.windowId) {
         return false
     }
+    PersistedLayout.windowRestored()
     let monitors = monitors
     let topLeftCornerToMonitor = monitors.grouped { $0.rect.topLeftCorner }
 
@@ -96,15 +103,15 @@ private func restoreTreeRecursive(frozenContainer: FrozenContainer, parent: NonL
         index: index,
     )
 
-    for (index, child) in frozenContainer.children.enumerated() {
+    // A window that is gone (closed since, or not detected yet at startup) is skipped and the rest keep their
+    // order: stopping here would leave every later window where it was detected, off its workspace.
+    for child in frozenContainer.children {
         switch child {
             case .window(let w):
-                // Stop the loop if can't find the window, because otherwise all the subsequent windows will have incorrect index
-                guard let window = MacWindow.get(byId: w.id) else { return false }
-                window.bind(to: container, adaptiveWeight: w.weight, index: index)
+                guard let window = MacWindow.get(byId: w.id) else { continue }
+                window.bind(to: container, adaptiveWeight: w.weight, index: INDEX_BIND_LAST)
             case .container(let c):
-                // There is no reason to continue
-                if !restoreTreeRecursive(frozenContainer: c, parent: container, index: index) { return false }
+                restoreTreeRecursive(frozenContainer: c, parent: container, index: INDEX_BIND_LAST)
         }
     }
     return true

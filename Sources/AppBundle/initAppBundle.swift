@@ -22,6 +22,8 @@ import Foundation
         GlobalObserver.initObserver()
         Workspace.garbageCollectUnusedWorkspaces() // init workspaces
         _ = Workspace.all.first?.focusWorkspace()
+        let restoredLayout = PersistedLayout.load()
+        if let restoredLayout { seedClosedWindowsCache(restoredLayout) }
         await runHeavyCompleteRefreshSession(
             .startup,
             // It's important for the first initialization to be non cancellable
@@ -30,9 +32,14 @@ import Foundation
             layoutWorkspaces: false,
         )
         try await runLightSession(.startup, .forceRun) {
-            smartLayoutAtStartup()
+            if !PersistedLayout.didRestore {
+                smartLayoutAtStartup()
+            } else if let name = PersistedLayout.focusedWorkspaceAtLoad {
+                _ = Workspace.get(byName: name).focusWorkspace()
+            }
             _ = await config.afterStartupCommand.run(.defaultEnv, .emptyStdin)
         }
+        PersistedLayout.isSavingEnabled = true
     }
 }
 
