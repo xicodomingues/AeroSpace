@@ -80,6 +80,7 @@ final class MacWindow: Window {
         if MacWindow.allWindowsMap.removeValue(forKey: windowId) == nil {
             return
         }
+        aeroDebugLog("garbage collect window \(windowId) of \(macApp.rawAppBundleId ?? "?"), event \(String(describing: refreshSessionEvent)), closed by command: \(skipClosedWindowsCache)")
         if !skipClosedWindowsCache { cacheClosedWindowIfNeeded() }
         let parent = unbindFromParent().parent
         let deadWindowWorkspace = parent.nodeWorkspace

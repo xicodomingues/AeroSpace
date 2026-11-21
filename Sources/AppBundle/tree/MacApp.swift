@@ -324,15 +324,27 @@ final class MacApp: AbstractApp {
             return []
         }
         guard let thread else { return [] }
-        let (alive, dead) = try await thread.runInLoop(.cancellable) { [nsApp, windows, axApp] (job) -> ([UInt32], [UInt32]) in
+        let keepBlankWhileAwake = await MainActor.run { BlankAxGrace.allowsKeepingWhileAwake }
+        let (alive, dead, keptWhileAwake) = try await thread.runInLoop(.cancellable) { [nsApp, windows, axApp] (job) -> ([UInt32], [UInt32], Bool) in
             var alive: [UInt32: AxWindow] = windows.threadGuarded
             var dead = [UInt32: AxWindow]()
+            var keptWhileAwake = false
             // Second line of defence against lock screen. See the first line of defence: closedWindowsCache
             // Second and third lines of defence are technically needed only to avoid potential flickering
             if frontmostAppBundleId != lockScreenAppBundleId {
                 (alive, dead) = try alive.partition {
                     try job.checkCancellation()
-                    return $0.value.ax.containingWindowId() != nil
+                    if $0.value.ax.containingWindowId() != nil { return true }
+                    // Displays asleep (and other moments when accessibility goes blank without the lock screen in
+                    // front): the window is not closed while the window server still shows it. Dropping it here
+                    // makes it a brand new window on wake, placed by on-window-detected or on the focused workspace.
+                    // A closing window is on screen too while it fades out, so with the displays awake it is kept
+                    // only for a short grace period, and looked at again (BlankAxGrace).
+                    let asleep = CGDisplayIsAsleep(CGMainDisplayID()) != 0
+                    let kept = isOnScreenInWindowServer($0.key) && (asleep || keepBlankWhileAwake)
+                    if kept && !asleep { keptWhileAwake = true }
+                    aeroDebugLog("ax blank for window \($0.key) of \(nsApp.bundleIdentifier ?? "?"): \(kept ? "kept, still on screen" : "dead") (displays \(asleep ? "asleep" : "awake"))")
+                    return kept
                 }
             }
 
@@ -342,8 +354,9 @@ final class MacApp: AbstractApp {
             }
 
             windows.threadGuarded = alive
-            return (Array(alive.keys), Array(dead.keys))
+            return (Array(alive.keys), Array(dead.keys), keptWhileAwake)
         }
+        if keptWhileAwake { await MainActor.run { BlankAxGrace.keptWhileAwake() } }
         windowsCount = alive.count
         for windowId in dead {
             setFrameJobs.removeValue(forKey: windowId)?.cancel()
@@ -454,4 +467,52 @@ private func disableAnimations<T>(app: AXUIElement, _ job: RunLoopJob, _ body: (
     }
     try job.checkCancellation()
     return try body()
+}
+
+/// How long a window with blank accessibility is kept while the displays are awake: it may be closing (on
+/// screen while it fades out), or accessibility may be coming back after a wake. Each time one is kept, a refresh
+/// is scheduled to look again, because a finished close animation sends no event of its own.
+@MainActor enum BlankAxGrace {
+    private static let grace: TimeInterval = 3
+    private static let quiet: TimeInterval = 5
+    private static var firstKept: Date? = nil
+    private static var lastKept: Date = .distantPast
+    private static var recheck: Task<(), any Error>? = nil
+
+    static var allowsKeepingWhileAwake: Bool {
+        guard let firstKept, lastKept.distance(to: .now) < quiet else { return true }
+        return firstKept.distance(to: .now) < grace
+    }
+
+    static func keptWhileAwake() {
+        if firstKept == nil || lastKept.distance(to: .now) >= quiet { firstKept = .now }
+        lastKept = .now
+        if recheck != nil { return }
+        recheck = Task.startUnstructured { @MainActor in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            recheck = nil
+            if TrayMenuModel.shared.isEnabled { scheduleCancellableCompleteRefreshSession(.ax("blankAxRecheck")) }
+        }
+    }
+}
+
+/// Whether the window server still has the window on screen. Asks no accessibility API, so it answers while
+/// accessibility is unobservable. A window an app closed but kept allocated is not on screen.
+func isOnScreenInWindowServer(_ windowId: UInt32) -> Bool {
+    let info = CGWindowListCopyWindowInfo([.optionIncludingWindow], CGWindowID(windowId)) as? [[String: Any]]
+    return info?.first?[kCGWindowIsOnscreen as String] as? Bool == true
+}
+
+/// Appends to /tmp/aerospace-debug.log while /tmp/aerospace-debug.on exists.
+func aeroDebugLog(_ msg: @autoclosure () -> String) {
+    guard FileManager.default.fileExists(atPath: "/tmp/aerospace-debug.on") else { return }
+    let line = "\(Date().timeIntervalSince1970) \(msg())\n"
+    guard let data = line.data(using: .utf8) else { return }
+    if let handle = FileHandle(forWritingAtPath: "/tmp/aerospace-debug.log") {
+        handle.seekToEndOfFile()
+        handle.write(data)
+        handle.closeFile()
+    } else {
+        FileManager.default.createFile(atPath: "/tmp/aerospace-debug.log", contents: data)
+    }
 }
